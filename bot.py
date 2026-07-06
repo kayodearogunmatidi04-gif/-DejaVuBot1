@@ -4,17 +4,20 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # ===== CONFIGURATION =====
 TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN environment variable not set!")
+
 DATABASE = "messages.db"
 REPOST_WINDOW_HOURS = 24  # How far back to check for duplicates
-SIMILARITY_THRESHOLD = 0.85  # For fuzzy matching (0.0-1.0)
 
 # ===== LOGGING =====
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_chat ON messages(chat_id)")
     conn.commit()
     conn.close()
+    logger.info("✅ Database initialized")
 
 def save_message(chat_id, message_id, user_id, username, content):
     content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -52,17 +56,17 @@ def save_message(chat_id, message_id, user_id, username, content):
     conn.close()
     return content_hash
 
-def find_duplicates(chat_id, content_hash, content, hours_back=24):
+def find_duplicates(chat_id, content_hash, current_msg_id, hours_back=24):
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     cutoff = datetime.now() - timedelta(hours=hours_back)
     c.execute("""
         SELECT message_id, username, content_preview, timestamp 
         FROM messages 
-        WHERE chat_id = ? AND content_hash = ? AND timestamp > ?
+        WHERE chat_id = ? AND content_hash = ? AND timestamp > ? AND message_id != ?
         ORDER BY timestamp DESC
-        LIMIT 5
-    """, (chat_id, content_hash, cutoff))
+        LIMIT 3
+    """, (chat_id, content_hash, cutoff, current_msg_id))
     results = c.fetchall()
     conn.close()
     return results
@@ -73,12 +77,9 @@ def get_stats(chat_id):
     c.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,))
     total = c.fetchone()[0]
     c.execute("""
-        SELECT COUNT(*) FROM (
-            SELECT content_hash, MIN(timestamp) 
-            FROM messages 
-            WHERE chat_id = ? 
-            GROUP BY content_hash
-        )
+        SELECT COUNT(DISTINCT content_hash) 
+        FROM messages 
+        WHERE chat_id = ?
     """, (chat_id,))
     unique = c.fetchone()[0]
     conn.close()
@@ -121,10 +122,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/settings - Adjust detection settings\n"
         "/clear - Clear this group's history (admin only)\n"
         "/help - Show this guide\n\n"
-        "**Settings you can adjust:**\n"
-        "• Detection window (6h, 12h, 24h, 48h)\n"
-        "• Auto-delete duplicates\n"
-        "• Ignore certain users\n\n"
         "💡 **Tip:** Add me as an admin for auto-delete features!",
         parse_mode="Markdown"
     )
@@ -143,7 +140,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔄 Duplicates found: `{duplicates}`\n"
         f"📈 Duplicate rate: `{dup_percent:.1f}%`\n"
         f"⏱️ Detection window: `{REPOST_WINDOW_HOURS} hours`\n\n"
-        f"_Stats since bot was added_",
+        "_Stats since bot was added_",
         parse_mode="Markdown"
     )
 
@@ -168,9 +165,12 @@ async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply = "📋 **Recent messages:**\n\n"
     for i, (preview, username, timestamp) in enumerate(results, 1):
-        time_ago = datetime.now() - datetime.fromisoformat(timestamp)
-        hours = int(time_ago.total_seconds() / 3600)
-        reply += f"{i}. `{preview}`\n   👤 @{username or 'unknown'} • {hours}h ago\n\n"
+        try:
+            time_ago = datetime.now() - datetime.fromisoformat(timestamp)
+            hours = int(time_ago.total_seconds() / 3600)
+            reply += f"{i}. `{preview}`\n   👤 @{username or 'unknown'} • {hours}h ago\n\n"
+        except:
+            reply += f"{i}. `{preview}`\n   👤 @{username or 'unknown'}\n\n"
     
     await update.message.reply_text(reply, parse_mode="Markdown")
 
@@ -180,7 +180,6 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏱️ Detection Window", callback_data="set_window")],
         [InlineKeyboardButton("🗑️ Auto-Delete Duplicates", callback_data="set_autodelete")],
         [InlineKeyboardButton("🚫 Ignore Users", callback_data="set_ignore")],
-        [InlineKeyboardButton("📊 Export Stats", callback_data="export_stats")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
@@ -191,7 +190,6 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear chat history (admin only)"""
-    # Check if user is admin (simplified - you can add proper admin check)
     chat_id = update.effective_chat.id
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
@@ -200,10 +198,26 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("🗑️ Chat history cleared successfully!")
 
+async def setwindow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set detection window"""
+    try:
+        hours = int(context.args[0])
+        if hours not in [6, 12, 24, 48]:
+            await update.message.reply_text("❌ Please choose: 6, 12, 24, or 48 hours")
+            return
+        global REPOST_WINDOW_HOURS
+        REPOST_WINDOW_HOURS = hours
+        await update.message.reply_text(f"✅ Detection window set to {hours} hours!")
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Usage: /setwindow <6|12|24|48>")
+
 # ===== MESSAGE HANDLER =====
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process incoming messages and detect duplicates"""
+    if not update.message or not update.message.text:
+        return
+        
     message = update.message
     chat_id = message.chat_id
     user_id = message.from_user.id
@@ -211,35 +225,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Get text content
     content = message.text or message.caption or ""
-    if not content:
-        return  # Skip non-text messages
+    if not content or len(content.strip()) < 3:
+        return  # Skip very short messages
     
     # Save message and get hash
     content_hash = save_message(chat_id, message.message_id, user_id, username, content)
     
-    # Check for duplicates
-    duplicates = find_duplicates(chat_id, content_hash, content, REPOST_WINDOW_HOURS)
+    # Check for duplicates (excluding current message)
+    duplicates = find_duplicates(chat_id, content_hash, message.message_id, REPOST_WINDOW_HOURS)
     
     # If duplicates found, reply
-    if duplicates and len(duplicates) > 1:  # Exclude current message
-        # Skip if duplicate count is 1 (only current message)
-        duplicate_count = len([d for d in duplicates if d[0] != message.message_id])
-        if duplicate_count > 0:
-            warning_msg = f"⚠️ **Duplicate Detected!**\n\n"
-            warning_msg += f"🔄 This message was already posted {duplicate_count} time(s) in the last {REPOST_WINDOW_HOURS}h.\n\n"
-            warning_msg += f"**Previous posts:**\n"
-            for msg_id, username, preview, timestamp in duplicates[:3]:
-                if msg_id != message.message_id:
-                    time_ago = datetime.now() - datetime.fromisoformat(timestamp)
-                    hours = int(time_ago.total_seconds() / 3600)
-                    warning_msg += f"• @{username or 'unknown'} - {hours}h ago: `{preview}`\n"
-            
-            # Add warning emoji
-            warning_msg += f"\n💡 _Please avoid reposting content!_"
-            
+    if duplicates:
+        warning_msg = f"⚠️ **Duplicate Detected!**\n\n"
+        warning_msg += f"🔄 This message was already posted in the last {REPOST_WINDOW_HOURS}h.\n\n"
+        warning_msg += f"**Previous posts:**\n"
+        for msg_id, username, preview, timestamp in duplicates[:3]:
+            try:
+                time_ago = datetime.now() - datetime.fromisoformat(timestamp)
+                hours = int(time_ago.total_seconds() / 3600)
+                warning_msg += f"• @{username or 'unknown'} - {hours}h ago: `{preview}`\n"
+            except:
+                warning_msg += f"• @{username or 'unknown'}: `{preview}`\n"
+        
+        warning_msg += f"\n💡 _Please avoid reposting content!_"
+        
+        try:
             await message.reply_text(warning_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send warning: {e}")
 
-# ===== CALLBACK HANDLER FOR SETTINGS =====
+# ===== CALLBACK HANDLER =====
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button presses in settings menu"""
@@ -275,12 +290,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ignored users won't trigger duplicate warnings.",
             parse_mode="Markdown"
         )
-    elif query.data == "export_stats":
-        await query.edit_message_text(
-            "📊 **Export Stats**\n\n"
-            "Feature coming soon! I'll generate a CSV report of all duplicates found.",
-            parse_mode="Markdown"
-        )
 
 # ===== MAIN =====
 
@@ -288,9 +297,8 @@ def main():
     """Start the bot"""
     # Initialize database
     init_db()
-    logger.info("✅ Database initialized")
     
-    # Create application
+    # Create application with proper builder
     application = Application.builder().token(TOKEN).build()
     
     # Add command handlers
@@ -300,6 +308,7 @@ def main():
     application.add_handler(CommandHandler("recent", recent))
     application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CommandHandler("clear", clear))
+    application.add_handler(CommandHandler("setwindow", setwindow))
     
     # Add callback handler for buttons
     application.add_handler(CallbackQueryHandler(button_callback))
